@@ -10,29 +10,13 @@ import (
 	"go.uber.org/zap"
 )
 
-const (
-	defaultTableName = "data42"
-	defaultBatchSize = 1000000
-)
-
-type Config struct {
-	TableName string
-	BatchSize int
-}
-
 // RunCopy runs COPY query to ingest data as fast as possible.
 // It generates random data and inserts it into the table.
 func RunCopy(ctx context.Context, connstr string, conf Config) error {
 	log.Info(ctx, "ingest started", zap.Any("conf", conf))
 	defer log.Info(ctx, "ingest finished")
 
-	if conf.TableName == "" {
-		conf.TableName = defaultTableName
-	}
-
-	if conf.BatchSize == 0 {
-		conf.BatchSize = defaultBatchSize
-	}
+	conf.Normalize()
 
 	conn, err := pgx.Connect(ctx, connstr)
 	if err != nil {

@@ -7,6 +7,26 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+const (
+	defaultTableName = "data42"
+	defaultBatchSize = 1000000
+)
+
+type Config struct {
+	TableName string
+	BatchSize int
+}
+
+func (conf *Config) Normalize() {
+	if conf.TableName == "" {
+		conf.TableName = defaultTableName
+	}
+
+	if conf.BatchSize == 0 {
+		conf.BatchSize = defaultBatchSize
+	}
+}
+
 // createTable creates table if not exists.
 // It uses default schema for pgbench_history.
 //
