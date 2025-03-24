@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -32,13 +33,13 @@ func (l *Launcher) Run(ctx context.Context, connstr string, query Query) ExecSta
 		return stats
 	}
 
-	n := 25
-
 	for iter := 0; iter < 4; iter++ {
-		n *= 2
+		n := rand.IntN(100) + 10
 
 		ch := make(chan ExecStats, n)
 		multi.RunMany(ctx, n, func(ctx context.Context) error {
+			time.Sleep(time.Duration(rand.IntN(1000)) * time.Millisecond)
+
 			res := executeAndMeasure(ctx, connstr, query, iterationDuration)
 			ch <- res
 			return res.Error
