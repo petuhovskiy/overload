@@ -45,8 +45,7 @@ func (g *Generator) SavePrevResult(success, failed string) {
 }
 
 // DumpSchema retrieves the schema of the database and returns it as a string.
-// It gathers full information about tables, including columns, types, constraints,
-// indexes, relationships, and sizes of tables and indexes.
+// It returns a compact representation of tables with their columns, primary keys, and foreign keys.
 func (g *Generator) DumpSchema(conn *pgx.Conn) (string, error) {
 	ctx := context.Background()
 	var sb strings.Builder
@@ -58,7 +57,7 @@ func (g *Generator) DumpSchema(conn *pgx.Conn) (string, error) {
 		WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
 		ORDER BY table_schema, table_name;
 	`
-	// Load all table info into a slice so we don't hold an open query while issuing new ones.
+	// Load all table info into a slice
 	rows, err := conn.Query(ctx, tableQuery)
 	if err != nil {
 		return "", err
@@ -78,14 +77,41 @@ func (g *Generator) DumpSchema(conn *pgx.Conn) (string, error) {
 	}
 	rows.Close()
 
-	// Process each table from the buffered slice.
+	// Process each table
 	for _, t := range tables {
 		fullTableName := fmt.Sprintf("%s.%s", t.Schema, t.Name)
-		sb.WriteString(fmt.Sprintf("Table: %s\n", fullTableName))
 
-		// Retrieve columns for the current table.
+		// Get table size for size indication
+		var tableSize int64
+		err = conn.QueryRow(ctx, `SELECT pg_total_relation_size($1)`, fullTableName).Scan(&tableSize)
+		if err != nil {
+			return "", err
+		}
+
+		// Format size in a readable way
+		sizeStr := "small"
+		if tableSize > 10*1024*1024 { // 10MB
+			sizeStr = "medium"
+		}
+		if tableSize > 100*1024*1024 { // 100MB
+			sizeStr = "large"
+		}
+
+		sb.WriteString(fmt.Sprintf("TABLE %s (%s):\n", fullTableName, sizeStr))
+
+		// Retrieve columns with condensed output
 		colQuery := `
-			SELECT column_name, data_type, is_nullable, column_default
+			SELECT 
+				column_name, 
+				data_type, 
+				is_nullable,
+				CASE WHEN column_default IS NOT NULL THEN 'DEFAULT ' || column_default ELSE '' END as default_value,
+				CASE WHEN EXISTS (
+					SELECT 1 FROM information_schema.table_constraints tc
+					JOIN information_schema.constraint_column_usage ccu ON tc.constraint_name = ccu.constraint_name
+					WHERE tc.table_schema = $1 AND tc.table_name = $2
+					AND tc.constraint_type = 'PRIMARY KEY' AND ccu.column_name = columns.column_name
+				) THEN 'PK' ELSE '' END AS is_pk
 			FROM information_schema.columns
 			WHERE table_schema = $1 AND table_name = $2
 			ORDER BY ordinal_position;
@@ -94,75 +120,50 @@ func (g *Generator) DumpSchema(conn *pgx.Conn) (string, error) {
 		if err != nil {
 			return "", err
 		}
+
 		for colRows.Next() {
-			var column, dataType, isNullable string
-			var colDefault *string
-			if err := colRows.Scan(&column, &dataType, &isNullable, &colDefault); err != nil {
+			var column, dataType, isNullable, defaultValue, isPK string
+			if err := colRows.Scan(&column, &dataType, &isNullable, &defaultValue, &isPK); err != nil {
 				colRows.Close()
 				return "", err
 			}
-			defaultStr := "NULL"
-			if colDefault != nil {
-				defaultStr = *colDefault
+
+			nullable := ""
+			if isNullable == "NO" {
+				nullable = "NOT NULL"
 			}
-			sb.WriteString(fmt.Sprintf("  Column: %s, Type: %s, Nullable: %s, Default: %s\n",
-				column, dataType, isNullable, defaultStr))
+
+			pkStr := ""
+			if isPK == "PK" {
+				pkStr = "PRIMARY KEY"
+			}
+
+			parts := []string{dataType}
+			if nullable != "" {
+				parts = append(parts, nullable)
+			}
+			if defaultValue != "" {
+				parts = append(parts, defaultValue)
+			}
+			if pkStr != "" {
+				parts = append(parts, pkStr)
+			}
+
+			sb.WriteString(fmt.Sprintf("  %s: %s\n", column, strings.Join(parts, " ")))
 		}
 		colRows.Close()
 
-		// Retrieve constraints (primary keys, unique, foreign keys, etc.)
-		consQuery := `
-			SELECT constraint_type, constraint_name
-			FROM information_schema.table_constraints
-			WHERE table_schema = $1 AND table_name = $2;
-		`
-		consRows, err := conn.Query(ctx, consQuery, t.Schema, t.Name)
-		if err != nil {
-			return "", err
-		}
-		for consRows.Next() {
-			var consType, consName string
-			if err := consRows.Scan(&consType, &consName); err != nil {
-				consRows.Close()
-				return "", err
-			}
-			sb.WriteString(fmt.Sprintf("  Constraint: %s - %s\n", consType, consName))
-		}
-		consRows.Close()
-
-		// Retrieve indexes for the current table.
-		idxQuery := `
-			SELECT indexname, indexdef
-			FROM pg_indexes
-			WHERE schemaname = $1 AND tablename = $2;
-		`
-		idxRows, err := conn.Query(ctx, idxQuery, t.Schema, t.Name)
-		if err != nil {
-			return "", err
-		}
-		for idxRows.Next() {
-			var idxName, idxDef string
-			if err := idxRows.Scan(&idxName, &idxDef); err != nil {
-				idxRows.Close()
-				return "", err
-			}
-			sb.WriteString(fmt.Sprintf("  Index: %s, Definition: %s\n", idxName, idxDef))
-		}
-		idxRows.Close()
-
-		// Retrieve foreign key relationships.
+		// Retrieve foreign keys - simplified output
 		fkQuery := `
-			SELECT tc.constraint_name, kcu.column_name, 
-			       ccu.table_schema AS foreign_table_schema,
-			       ccu.table_name AS foreign_table_name,
-			       ccu.column_name AS foreign_column_name
+			SELECT 
+				kcu.column_name,  
+				ccu.table_schema || '.' || ccu.table_name AS references_table,
+				ccu.column_name AS references_column
 			FROM information_schema.table_constraints AS tc
 			JOIN information_schema.key_column_usage AS kcu
 			  ON tc.constraint_name = kcu.constraint_name
-			  AND tc.table_schema = kcu.table_schema
 			JOIN information_schema.constraint_column_usage AS ccu
 			  ON ccu.constraint_name = tc.constraint_name
-			  AND ccu.table_schema = tc.table_schema
 			WHERE tc.constraint_type = 'FOREIGN KEY'
 			  AND tc.table_schema = $1
 			  AND tc.table_name = $2;
@@ -171,32 +172,56 @@ func (g *Generator) DumpSchema(conn *pgx.Conn) (string, error) {
 		if err != nil {
 			return "", err
 		}
+
+		hasForeignKeys := false
 		for fkRows.Next() {
-			var consName, colName, foreignSchema, foreignTable, foreignCol string
-			if err := fkRows.Scan(&consName, &colName, &foreignSchema, &foreignTable, &foreignCol); err != nil {
+			if !hasForeignKeys {
+				sb.WriteString("  FOREIGN KEYS:\n")
+				hasForeignKeys = true
+			}
+
+			var colName, refsTable, refsCol string
+			if err := fkRows.Scan(&colName, &refsTable, &refsCol); err != nil {
 				fkRows.Close()
 				return "", err
 			}
-			sb.WriteString(fmt.Sprintf("  Foreign Key: %s, Column: %s references %s.%s(%s)\n",
-				consName, colName, foreignSchema, foreignTable, foreignCol))
+			sb.WriteString(fmt.Sprintf("    %s -> %s(%s)\n", colName, refsTable, refsCol))
 		}
 		fkRows.Close()
 
-		// Retrieve the total table size (including indexes).
-		var tableSize int64
-		err = conn.QueryRow(ctx, `SELECT pg_total_relation_size($1)`, fullTableName).Scan(&tableSize)
+		// Get important indexes (non-primary key indexes) - simplified
+		idxQuery := `
+			SELECT indexname, indexdef
+			FROM pg_indexes
+			WHERE schemaname = $1 AND tablename = $2
+			AND indexname NOT LIKE '%_pkey';
+		`
+		idxRows, err := conn.Query(ctx, idxQuery, t.Schema, t.Name)
 		if err != nil {
 			return "", err
 		}
-		sb.WriteString(fmt.Sprintf("  Total Size: %d bytes\n", tableSize))
 
-		// Retrieve the total indexes size for the table.
-		var indexesSize int64
-		err = conn.QueryRow(ctx, `SELECT pg_indexes_size($1)`, fullTableName).Scan(&indexesSize)
-		if err != nil {
-			return "", err
+		hasIndexes := false
+		for idxRows.Next() {
+			if !hasIndexes {
+				sb.WriteString("  INDEXES:\n")
+				hasIndexes = true
+			}
+
+			var idxName, idxDef string
+			if err := idxRows.Scan(&idxName, &idxDef); err != nil {
+				idxRows.Close()
+				return "", err
+			}
+			// Extract just the essential part of the index definition
+			parts := strings.Split(idxDef, "USING")
+			if len(parts) > 1 {
+				sb.WriteString(fmt.Sprintf("    %s: USING%s\n", idxName, parts[1]))
+			} else {
+				sb.WriteString(fmt.Sprintf("    %s\n", idxName))
+			}
 		}
-		sb.WriteString(fmt.Sprintf("  Indexes Size: %d bytes\n", indexesSize))
+		idxRows.Close()
 
 		sb.WriteString("\n")
 	}
