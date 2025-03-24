@@ -21,12 +21,14 @@ type Generator struct {
 	client     *openai.Client
 	history    *DBHistory
 	prevPrompt string
+	launcher   *Launcher
 }
 
 func NewGenerator(client *openai.Client, history *DBHistory) *Generator {
 	return &Generator{
-		client:  client,
-		history: history,
+		client:   client,
+		history:  history,
+		launcher: &Launcher{db: history},
 	}
 }
 
@@ -306,7 +308,7 @@ func (g *Generator) DoIteration(ctx context.Context, connstr string) error {
 	for _, query := range queries {
 		go func(q Query) {
 			defer wg.Done()
-			stats, err := StressQuery(ctx, connstr, q)
+			stats := g.launcher.Run(ctx, connstr, q)
 
 			resMutex.Lock()
 			defer resMutex.Unlock()
