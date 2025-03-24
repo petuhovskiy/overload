@@ -4,35 +4,12 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"sync"
-	"time"
 
-	"github.com/petuhovskiy/overload/ingest"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/petuhovskiy/overload/autoai"
 	"github.com/petuhovskiy/overload/internal/log"
-	"go.uber.org/zap"
+	"github.com/sashabaranov/go-openai"
 )
-
-func runMany(ctx context.Context, n int, f func(ctx context.Context) error) {
-	var wg sync.WaitGroup
-	wg.Add(n)
-
-	for i := 0; i < n; i++ {
-		i := i
-		ctx := log.With(ctx, zap.Int("worker", i))
-
-		go func() {
-			defer wg.Done()
-			err := f(ctx)
-			if err != nil {
-				log.Error(ctx, "worker failed", zap.Error(err))
-			} else {
-				log.Info(ctx, "worker finished")
-			}
-		}()
-	}
-
-	wg.Wait()
-}
 
 func main() {
 	_ = log.DefaultGlobals()
@@ -46,18 +23,36 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start the reporter in a separate goroutine
-	go ingest.ReportUploadSpeed(ctx, connstr)
+	logsConnstr := os.Getenv("LOGS_CONNSTR")
+	pool, err := pgxpool.New(context.Background(), logsConnstr)
+	if err != nil {
+		fmt.Println("Error: failed to connect to database:", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+	dbHistory := autoai.NewDBHistory(pool)
 
-	// Configure and run the ingest operation
-	conf := ingest.Config{
-		TableName: "data42",
+	openaiToken := os.Getenv("OPENAI_TOKEN")
+	openaiClient := openai.NewClient(openaiToken)
+
+	gen := autoai.NewGenerator(openaiClient, dbHistory)
+
+	for {
+		gen.DoIteration(ctx, connstr)
 	}
 
-	runMany(ctx, 10, func(ctx context.Context) error {
-		return ingest.RunCopy(ctx, connstr, conf)
-	})
+	// // Start the reporter in a separate goroutine
+	// go ingest.ReportUploadSpeed(ctx, connstr)
 
-	// Allow some time for the reporter to show the final results
-	time.Sleep(5 * time.Second)
+	// // Configure and run the ingest operation
+	// conf := ingest.Config{
+	// 	TableName: "data42",
+	// }
+
+	// multi.RunMany(ctx, 10, func(ctx context.Context) error {
+	// 	return ingest.RunCopy(ctx, connstr, conf)
+	// })
+
+	// // Allow some time for the reporter to show the final results
+	// time.Sleep(5 * time.Second)
 }
